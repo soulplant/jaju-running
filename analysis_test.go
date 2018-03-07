@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bytes"
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -14,6 +15,7 @@ import (
 
 func run(time time.Time, duration time.Duration, distance float64) *strava.ActivitySummary {
 	return &strava.ActivitySummary{
+		Athlete:     strava.AthleteSummary{FirstName: "james"},
 		Type:        strava.ActivityTypes.Run,
 		StartDate:   time,
 		ElapsedTime: int(duration.Seconds()),
@@ -30,27 +32,21 @@ func ride(time time.Time, duration time.Duration, distance float64) *strava.Acti
 	}
 }
 
-func Must(t time.Time, err error) time.Time {
-	if err != nil {
-		panic(err)
-	}
-	return t
-}
+var saturday = Must(time.Parse("2006-01-02", "2018-03-03"))
+var monday = Must(time.Parse("2006-01-02", "2018-03-05"))
+var tuesday = monday.Add(24 * time.Hour)
+var nextSaturday = saturday.Add(7 * 24 * time.Hour)
+
+const morning = 8 * time.Hour
+const afternoon = 18 * time.Hour
+
+var week1 = saturday
+var week2 = saturday.Add(7 * 24 * time.Hour)
+
+const short = 10.0
+const long = 20.0
 
 func TestMarathon(t *testing.T) {
-	saturday := Must(time.Parse("2006-01-02", "2018-03-03"))
-	monday := Must(time.Parse("2006-01-02", "2018-03-05"))
-	tuesday := monday.Add(24 * time.Hour)
-	nextSaturday := saturday.Add(7 * 24 * time.Hour)
-
-	morning := 8 * time.Hour
-	afternoon := 18 * time.Hour
-
-	week1 := saturday
-	week2 := saturday.Add(7 * 24 * time.Hour)
-
-	short := 10.0
-	long := 20.0
 
 	tcs := []struct {
 		message    string
@@ -114,8 +110,8 @@ func TestMarathon(t *testing.T) {
 	}
 
 	for _, tc := range tcs {
-		mt := ComputeMarathonTracking(tc.activities)
-		expected := &MarathonTracking{tc.summaries}
+		mt := ComputeWeeklySummaries(tc.activities)
+		expected := tc.summaries
 		if !reflect.DeepEqual(mt, expected) {
 			t.Errorf("Case '%s': Expected %v, but got %v", tc.message, expected, mt)
 		}
@@ -192,5 +188,54 @@ func TestFoo(t *testing.T) {
 	tw.Append([]string{"hi"})
 	tw.Render()
 	t.Logf(buf.String())
+	t.Fail()
+}
+
+type fakeFetcher struct {
+	acts []*strava.ActivitySummary
+}
+
+func (f fakeFetcher) FetchActivities(token string) ([]*strava.ActivitySummary, error) {
+	// return nil, errors.New("hi")
+	return f.acts, nil
+}
+
+func TestPrepareTable(t *testing.T) {
+	f := fakeFetcher{
+		acts: []*strava.ActivitySummary{run(saturday, 1*time.Hour, short)},
+	}
+	umt, err := FetchUserHistory([]User{{"not-read", "k", "abc123"}}, f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if umt[0].Name != "james" {
+		t.Error("Expected name to be james")
+	}
+}
+
+func process(acts ...*strava.ActivitySummary) []*UserMarathonTracking {
+	f := fakeFetcher{
+		acts: acts,
+	}
+	umt, err := FetchUserHistory([]User{{"not-read", "k", "abc123"}}, f)
+	if err != nil {
+		panic(err)
+	}
+	return umt
+}
+
+func TestTemplate(t *testing.T) {
+	buf := bytes.NewBuffer(nil)
+	umt := process(run(saturday, 1*time.Hour, 1), run(nextSaturday, 1*time.Hour, 2))
+	err := mainTpl.ExecuteTemplate(buf, "main.html.tpl", MainTplArgs{
+		Umt:         umt,
+		ClientId:    fmt.Sprintf("%d", 1234),
+		RedirectUri: "localhost:1234/oauth_receipt",
+	})
+	if err != nil {
+		t.Logf("got an error: %s", err)
+		t.Fail()
+	}
+	t.Logf("%s", buf.String())
 	t.Fail()
 }
