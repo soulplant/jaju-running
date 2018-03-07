@@ -100,6 +100,9 @@ func RegisterNewUser(ctx context.Context, ds *datastore.Client, auth *strava.Aut
 
 // Summary of runs done in a week.
 type WeekSummary struct {
+	// The day this week starts on.
+	Date time.Time
+
 	// How many runs were done this week.
 	Count int
 
@@ -115,8 +118,23 @@ type MarathonTracking struct {
 	weeks []WeekSummary
 }
 
+// Summary of weekly marathon training for a given user.
+type UserMarathonTracking struct {
+	Name             string
+	MarathonTracking *MarathonTracking
+}
+
+// PreviousSaturday gets the Saturday before this date, unless the given date is a Saturday.
+func PreviousSaturday(d time.Time) time.Time {
+	daysToGoBack := int(d.Weekday()) + 1
+	if d.Weekday() == time.Saturday {
+		daysToGoBack = 0
+	}
+	return d.Add(time.Duration(-daysToGoBack) * 24 * time.Hour).Truncate(24 * time.Hour)
+}
+
 // ComputeMarathonTracking summarises the input activities into the weekly marathon tracking stats.
-// Output will be sorted by week.
+// Output will be in chronological order.
 func ComputeMarathonTracking(activities []*strava.ActivitySummary) *MarathonTracking {
 	if len(activities) == 0 {
 		return &MarathonTracking{}
@@ -127,20 +145,22 @@ func ComputeMarathonTracking(activities []*strava.ActivitySummary) *MarathonTrac
 		return acts[i].StartDate.Before(acts[j].StartDate)
 	})
 	firstRunDate := acts[0].StartDate
-	curYear, curWeek := firstRunDate.ISOWeek()
+	curWeekStart := PreviousSaturday(firstRunDate)
 
 	var weeks [][]*strava.ActivitySummary
 	var weekActs []*strava.ActivitySummary
 
 	for _, a := range acts {
-		year, week := a.StartDate.ISOWeek()
-		if curYear == year && curWeek == week {
+		if a.Type != strava.ActivityTypes.Run {
+			continue
+		}
+		weekStart := PreviousSaturday(a.StartDate)
+		if curWeekStart == weekStart {
 			weekActs = append(weekActs, a)
 		} else {
 			weeks = append(weeks, weekActs)
 			weekActs = []*strava.ActivitySummary{a}
-			curYear = year
-			curWeek = week
+			curWeekStart = weekStart
 		}
 	}
 	if weekActs != nil {
@@ -157,6 +177,7 @@ func ComputeMarathonTracking(activities []*strava.ActivitySummary) *MarathonTrac
 			elapsed += a.ElapsedTime
 		}
 		sum := WeekSummary{
+			Date:     PreviousSaturday(w[0].StartDate),
 			Count:    len(w),
 			Distance: dist,
 			Time:     time.Duration(elapsed) * time.Second,
@@ -172,6 +193,57 @@ func FetchMarathonTrackingForUser(ctx context.Context, s *strava.Client) (*Marat
 		return nil, err
 	}
 	return ComputeMarathonTracking(as), nil
+}
+
+// GetUsers fetches all users from the datastore.
+func GetUsers(ctx context.Context, ds *datastore.Client) ([]User, error) {
+	result := make([]User, 0)
+	_, err := ds.GetAll(ctx, datastore.NewQuery("User"), &result)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func PrepareTable(ctx context.Context, ds *datastore.Client, httpClient *http.Client) (string, error) {
+	users, err := GetUsers(ctx, ds)
+	if err != nil {
+		return "", err
+	}
+	results := make(chan *UserMarathonTracking)
+	for _, u := range users {
+		go func() {
+			var result *UserMarathonTracking
+			defer func() {
+				results <- result
+			}()
+			s := strava.NewClient(u.StravaToken, httpClient)
+			acts, err := strava.NewCurrentAthleteService(s).ListActivities().Do()
+			if err != nil {
+				results <- nil
+				return
+			}
+			mt := ComputeMarathonTracking(acts)
+			name := acts[0].Athlete.FirstName
+
+			result = &UserMarathonTracking{
+				Name:             name,
+				MarathonTracking: mt,
+			}
+		}()
+	}
+
+	var mts []*UserMarathonTracking
+	for i := 0; i < len(users); i++ {
+		mts = append(mts, <-results)
+	}
+
+	// buf := bytes.NewBufferString("")
+	// for _, mt := range mts {
+	// 	tw := tablewriter.NewWriter(buf)
+	// 	tw.Append
+	// }
+	return "hi", nil
 }
 
 // userKey is a key based on strava's athlete id.
