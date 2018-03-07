@@ -1,0 +1,14 @@
+runtime: go
+api_version: go1
+
+handlers:
+  - url: /.*
+    script: _go_app
+
+env_variables:
+  DATASTORE_EMULATOR_HOST: 'localhost:8081'
+  NAMESPACE: 'test'
+  PROJECT_ID: 'dev'
+  STRAVA_CLIENT_ID: 'fake-id'
+  STRAVA_CLIENT_SECRET: 'fake-secret'
+  # DATASTORE_PROJECT_ID: 'crucial-media-167709'
