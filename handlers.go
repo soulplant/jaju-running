@@ -201,9 +201,28 @@ type MainTplArgs struct {
 	RedirectUri string
 }
 
+const mainTplText = `
+<div>
+  <div style="display: flex; justify-content: center">
+  {{range .Umt}}
+    <div style="padding: 0 1em">
+      <pre>{{.Name}}</pre>
+      <pre>
+{{. | makeTable}}
+      </pre>
+    </div>
+  {{end}}
+  </div>
+
+  <a href="https://www.strava.com/oauth/authorize?client_id={{.ClientId}}&redirect_uri={{.RedirectUri | urlquery}}&response_type=code">
+    Register
+  </a>
+</div>
+`
+
 var mainTpl = template.Must(template.New("").Funcs(template.FuncMap{
 	"makeTable": makeTable,
-}).ParseFiles("main.html.tpl"))
+}).Parse(mainTplText))
 
 // FetchUserHistory fetches each user's marathon training history.
 func FetchUserHistory(users []User, fetcher ActivityFetcher) ([]*UserMarathonTracking, error) {
@@ -303,25 +322,33 @@ func init() {
 	}))
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// w.Write([]byte("ok"))
 		ctx := appengine.NewContext(r)
 		ds := NewDatastore(ctx)
 		users, err := GetUsers(ctx, ds)
 		if err != nil {
-			panic(err)
+			handleError(w, err)
+			return
 		}
 		umt, err := FetchUserHistory(users, fetcher{urlfetch.Client(ctx)})
 		if err != nil {
-			panic(err)
+			handleError(w, err)
+			return
 		}
 
-		err = mainTpl.ExecuteTemplate(w, "main.html.tpl", MainTplArgs{
+		err = mainTpl.Execute(w, MainTplArgs{
 			Umt:         umt,
 			ClientId:    fmt.Sprintf("%d", stravaClientId),
-			RedirectUri: "foo",
+			RedirectUri: "jaju-running.appspot.com/oauth_callback",
 		})
 		if err != nil {
-			w.Write([]byte("error: " + err.Error()))
-			// panic(err)
+			handleError(w, err)
+			return
 		}
 	})
+}
+
+func handleError(w http.ResponseWriter, err error) {
+	w.WriteHeader(500)
+	w.Write([]byte(fmt.Sprintf("Failed: %s", err)))
 }

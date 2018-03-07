@@ -227,10 +227,10 @@ func process(acts ...*strava.ActivitySummary) []*UserMarathonTracking {
 func TestTemplate(t *testing.T) {
 	buf := bytes.NewBuffer(nil)
 	umt := process(run(saturday, 1*time.Hour, 1), run(nextSaturday, 1*time.Hour, 2))
-	err := mainTpl.ExecuteTemplate(buf, "main.html.tpl", MainTplArgs{
+	err := mainTpl.Execute(buf, MainTplArgs{
 		Umt:         umt,
 		ClientId:    fmt.Sprintf("%d", 1234),
-		RedirectUri: "localhost:1234/oauth_receipt",
+		RedirectUri: "localhost:1234/oauth_callback",
 	})
 	if err != nil {
 		t.Logf("got an error: %s", err)
