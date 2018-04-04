@@ -1,18 +1,19 @@
 package handlers
 
 import (
-	"bytes"
+	"errors"
 	"fmt"
 	"reflect"
 	"testing"
 	"time"
 
-	"cloud.google.com/go/datastore"
-	"github.com/olekukonko/tablewriter"
 	strava "github.com/strava/go.strava"
 	context "golang.org/x/net/context"
+	"google.golang.org/appengine"
+	"google.golang.org/appengine/aetest"
 )
 
+// run creates a run activity.
 func run(time time.Time, duration time.Duration, distance float64) *strava.ActivitySummary {
 	return &strava.ActivitySummary{
 		Athlete:     strava.AthleteSummary{FirstName: "james"},
@@ -23,6 +24,7 @@ func run(time time.Time, duration time.Duration, distance float64) *strava.Activ
 	}
 }
 
+// ride creates a ride activity.
 func ride(time time.Time, duration time.Duration, distance float64) *strava.ActivitySummary {
 	return &strava.ActivitySummary{
 		Type:        strava.ActivityTypes.Ride,
@@ -32,22 +34,39 @@ func ride(time time.Time, duration time.Duration, distance float64) *strava.Acti
 	}
 }
 
-var saturday = Must(time.Parse("2006-01-02", "2018-03-03"))
-var monday = Must(time.Parse("2006-01-02", "2018-03-05"))
-var tuesday = monday.Add(24 * time.Hour)
-var nextSaturday = saturday.Add(7 * 24 * time.Hour)
+// Must returns its input time or panics if there's an error.
+func Must(t time.Time, err error) time.Time {
+	if err != nil {
+		panic(err)
+	}
+	return t
+}
 
-const morning = 8 * time.Hour
-const afternoon = 18 * time.Hour
+var (
+	saturday     = Must(time.Parse("2006-01-02", "2018-03-03"))
+	monday       = Must(time.Parse("2006-01-02", "2018-03-05"))
+	tuesday      = monday.Add(24 * time.Hour)
+	nextSaturday = saturday.Add(7 * 24 * time.Hour)
+)
 
-var week1 = saturday
-var week2 = saturday.Add(7 * 24 * time.Hour)
+const (
+	morning   = 8 * time.Hour
+	afternoon = 18 * time.Hour
+)
 
-const short = 10.0
-const long = 20.0
+// Start dates for weeks.
+var (
+	week1 = saturday
+	week2 = saturday.Add(7 * 24 * time.Hour)
+)
+
+// Run durations in metres.
+const (
+	short = 5.6 * 1000
+	long  = 11.2 * 1000
+)
 
 func TestMarathon(t *testing.T) {
-
 	tcs := []struct {
 		message    string
 		activities []*strava.ActivitySummary
@@ -107,6 +126,16 @@ func TestMarathon(t *testing.T) {
 				{week1, 1, 20 * time.Minute, short},
 			},
 		},
+		{
+			message: "only rides in a week, then runs next week",
+			activities: []*strava.ActivitySummary{
+				ride(saturday.Add(morning), 20*time.Minute, short),
+				run(nextSaturday.Add(morning), 20*time.Minute, short),
+			},
+			summaries: []WeekSummary{
+				{week2, 1, 20 * time.Minute, short},
+			},
+		},
 	}
 
 	for _, tc := range tcs {
@@ -118,6 +147,7 @@ func TestMarathon(t *testing.T) {
 	}
 }
 
+// makeAuth returns a synthesised Strava auth response.
 func makeAuth(token, fname, lname string, id int64) *strava.AuthorizationResponse {
 	return &strava.AuthorizationResponse{
 		AccessToken: token,
@@ -134,24 +164,42 @@ func makeAuth(token, fname, lname string, id int64) *strava.AuthorizationRespons
 }
 
 func TestRegisterNewUser(t *testing.T) {
-	ds := InitTestDatastore(t)
-	out := make([]User, 0)
-	keys, err := ds.GetAll(context.Background(), datastore.NewQuery("User"), &out)
+	inst, err := aetest.NewInstance(&aetest.Options{
+		StronglyConsistentDatastore: true,
+	})
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
-	if len(keys) != 0 {
-		t.Error("Expected 0 keys, got " + string(len(keys)))
+
+	defer inst.Close() // nolint: errcheck
+	req, err := inst.NewRequest("GET", "/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := appengine.NewContext(req)
+	users, err := GetUsers(ctx)
+	if err != nil {
+		t.Fatalf("Couldn't read users: %s", err)
+	}
+	if len(users) != 0 {
+		t.Errorf("Expected 0 users, got %d", len(users))
 	}
 	auth := makeAuth("abc-123", "james", "k", 1234)
-	ctx := context.Background()
-	u, err := RegisterNewUser(ctx, ds, auth)
+	u, err := RegisterNewUser(ctx, auth)
 	if err != nil {
 		t.Fatalf("Failed to register user %s", err)
 	}
 	expectedU := &User{"james", "k", "abc-123"}
 	if !reflect.DeepEqual(u, expectedU) {
 		t.Fatalf("Expected %v got %v", u, expectedU)
+	}
+	// Note, this only works because datastore is run in strongly consistent mode.
+	users, err = GetUsers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(users) != 1 {
+		t.Errorf("Expected 1 user, got %d", len(users))
 	}
 }
 
@@ -181,61 +229,91 @@ func TestPreviousSaturday(t *testing.T) {
 	}
 }
 
-func TestFoo(t *testing.T) {
-	buf := bytes.NewBufferString("")
-	tw := tablewriter.NewWriter(buf)
-	tw.SetHeader([]string{"Date", "Count", "Distance", "Time"})
-	tw.Append([]string{"hi"})
-	tw.Render()
-	t.Logf(buf.String())
-	t.Fail()
-}
-
 type fakeFetcher struct {
 	acts []*strava.ActivitySummary
 }
 
 func (f fakeFetcher) FetchActivities(token string) ([]*strava.ActivitySummary, error) {
-	// return nil, errors.New("hi")
 	return f.acts, nil
 }
 
 func TestPrepareTable(t *testing.T) {
-	f := fakeFetcher{
-		acts: []*strava.ActivitySummary{run(saturday, 1*time.Hour, short)},
-	}
-	umt, err := FetchUserHistory([]User{{"not-read", "k", "abc123"}}, f)
+	f := stubFetcher(map[string][]*strava.ActivitySummary{
+		"abc123": []*strava.ActivitySummary{run(saturday, 1*time.Hour, short)},
+	})
+	umt, err := FetchUserHistory(context.Background(), []User{{"james2", "k", "abc123"}}, f)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if umt[0].Name != "james" {
-		t.Error("Expected name to be james")
+	if umt[0].Name != "james2" {
+		t.Error("Expected name to be james2, but was" + umt[0].Name)
 	}
 }
 
-func process(acts ...*strava.ActivitySummary) []*UserMarathonTracking {
-	f := fakeFetcher{
-		acts: acts,
+type stubFetcher map[string][]*strava.ActivitySummary
+
+func (sf stubFetcher) FetchActivities(token string) ([]*strava.ActivitySummary, error) {
+	acts, ok := sf[token]
+	if !ok {
+		return nil, errors.New("not found")
 	}
-	umt, err := FetchUserHistory([]User{{"not-read", "k", "abc123"}}, f)
-	if err != nil {
-		panic(err)
-	}
-	return umt
+	fmt.Printf("Returning '%s': %v", token, acts)
+	return acts, nil
 }
 
-func TestTemplate(t *testing.T) {
-	buf := bytes.NewBuffer(nil)
-	umt := process(run(saturday, 1*time.Hour, 1), run(nextSaturday, 1*time.Hour, 2))
-	err := mainTpl.Execute(buf, MainTplArgs{
-		Umt:         umt,
-		ClientId:    fmt.Sprintf("%d", 1234),
-		RedirectUri: "localhost:1234/oauth_callback",
+func TestFetchUsersActivity(t *testing.T) {
+	actsA := []*strava.ActivitySummary{run(saturday, 1*time.Hour, short)}
+	actsB := []*strava.ActivitySummary{run(monday, 1*time.Hour, short)}
+	m := map[string][]*strava.ActivitySummary{
+		"a": actsA,
+		"b": actsB,
+	}
+	f := stubFetcher(m)
+	_ = stubFetcher(map[string][]*strava.ActivitySummary{
+		"a": actsA,
 	})
-	if err != nil {
-		t.Logf("got an error: %s", err)
-		t.Fail()
+
+	cases := []struct {
+		users []User
+		acts  [][]*strava.ActivitySummary
+		fail  bool
+	}{
+		{
+			users: []User{{StravaToken: "a"}},
+			acts:  [][]*strava.ActivitySummary{actsA},
+		},
+		{
+			users: []User{{StravaToken: "a"}, {StravaToken: "b"}},
+			acts:  [][]*strava.ActivitySummary{actsA, actsB},
+		},
+		{
+			users: []User{{StravaToken: "b"}, {StravaToken: "b"}},
+			acts:  [][]*strava.ActivitySummary{actsB, actsB},
+		},
+		{
+			users: []User{{StravaToken: "b"}, {StravaToken: "a"}},
+			acts:  [][]*strava.ActivitySummary{actsB, actsA},
+		},
+		{
+			users: []User{{StravaToken: "a"}, {StravaToken: "mystery"}},
+			fail:  true,
+		},
+		{
+			users: []User{{StravaToken: "mystery"}},
+			fail:  true,
+		},
+		{
+			users: []User{{StravaToken: "mystery"}, {StravaToken: "other-mystery"}},
+			fail:  true,
+		},
 	}
-	t.Logf("%s", buf.String())
-	t.Fail()
+	for _, c := range cases {
+		acts, err := FetchUsersActivity(c.users, f)
+		if c.fail && err == nil {
+			t.Error("Expected a failure, but got nil error")
+		}
+		if !reflect.DeepEqual(acts, c.acts) {
+			t.Errorf("Expected acts %v, got %v", c.acts, acts)
+		}
+	}
 }

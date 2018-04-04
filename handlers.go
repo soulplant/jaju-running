@@ -1,37 +1,23 @@
 package handlers
 
 import (
-	"bytes"
 	"errors"
-	"flag"
 	"fmt"
-	"html/template"
-	"log"
 	"net/http"
 	"os"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 
-	"github.com/olekukonko/tablewriter"
 	"github.com/strava/go.strava"
 
 	"context"
 
-	"cloud.google.com/go/datastore"
 	"google.golang.org/appengine"
+	"google.golang.org/appengine/log"
 	"google.golang.org/appengine/urlfetch"
 )
-
-// The GCP project to connect to.
-var projectId = os.Getenv("PROJECT_ID")
-
-// The namespace to store all entities in datastore in.
-var namespace = os.Getenv("NAMESPACE")
-
-// Password for the site.
-var basicAuthUser = os.Getenv("BASIC_AUTH_USER")
-var basicAuthPass = os.Getenv("BASIC_AUTH_PASS")
 
 // User represents a Strava user who has authorised access to their data.
 type User struct {
@@ -40,37 +26,7 @@ type User struct {
 	StravaToken string
 }
 
-// NewDatastore creates a datastore client from an appengine context.
-func NewDatastore(ctx context.Context) *datastore.Client {
-	client, err := datastore.NewClient(ctx, projectId)
-	if err != nil {
-		panic(err)
-	}
-
-	return client
-}
-
-// NewStravaClient creates a strava client using the given access token.
-func NewStravaClient(ctx context.Context, accessToken string) *strava.Client {
-	return strava.NewClient(accessToken, urlfetch.Client(ctx))
-}
-
-// RegisterNewUser saves a new user's Strava token and basic details in the datastore.
-func RegisterNewUser(ctx context.Context, ds *datastore.Client, auth *strava.AuthorizationResponse) (*User, error) {
-	// Register new user.
-	user := User{
-		FirstName:   auth.Athlete.FirstName,
-		LastName:    auth.Athlete.LastName,
-		StravaToken: auth.AccessToken,
-	}
-	_, err := ds.Put(ctx, userKey(auth.Athlete.Id), &user)
-	if err != nil {
-		return nil, err
-	}
-	return &user, nil
-}
-
-// Summary of runs done in a week.
+// WeekSummary summarises runs that occur in the same week.
 type WeekSummary struct {
 	// The day this week starts on.
 	Date time.Time
@@ -85,7 +41,7 @@ type WeekSummary struct {
 	Distance float64
 }
 
-// Summary of weekly marathon training for a given user.
+// UserMarathonTracking is a history of weekly marathon training stats for a given user.
 type UserMarathonTracking struct {
 	Name  string
 	Weeks []WeekSummary
@@ -103,38 +59,39 @@ func PreviousSaturday(d time.Time) time.Time {
 // ComputeWeeklySummaries summarises the input activities into the weekly marathon tracking stats.
 // Output will be in chronological order.
 func ComputeWeeklySummaries(activities []*strava.ActivitySummary) []WeekSummary {
-	if len(activities) == 0 {
+	var runs []*strava.ActivitySummary
+	for _, act := range activities {
+		if act.Type == strava.ActivityTypes.Run {
+			runs = append(runs, act)
+		}
+	}
+	if len(runs) == 0 {
 		return nil
 	}
-	acts := make([]*strava.ActivitySummary, len(activities))
-	copy(acts, activities)
-	sort.Slice(acts, func(i, j int) bool {
-		return acts[i].StartDate.Before(acts[j].StartDate)
+	sort.Slice(runs, func(i, j int) bool {
+		return runs[i].StartDate.Before(runs[j].StartDate)
 	})
-	firstRunDate := acts[0].StartDate
+	firstRunDate := runs[0].StartDate
 	curWeekStart := PreviousSaturday(firstRunDate)
 
-	var weeks [][]*strava.ActivitySummary
-	var weekActs []*strava.ActivitySummary
+	var allWeeks [][]*strava.ActivitySummary
+	var thisWeek []*strava.ActivitySummary
 
-	for _, a := range acts {
-		if a.Type != strava.ActivityTypes.Run {
-			continue
-		}
-		weekStart := PreviousSaturday(a.StartDate)
+	for _, run := range runs {
+		weekStart := PreviousSaturday(run.StartDate)
 		if curWeekStart == weekStart {
-			weekActs = append(weekActs, a)
+			thisWeek = append(thisWeek, run)
 		} else {
-			weeks = append(weeks, weekActs)
-			weekActs = []*strava.ActivitySummary{a}
+			allWeeks = append(allWeeks, thisWeek)
+			thisWeek = []*strava.ActivitySummary{run}
 			curWeekStart = weekStart
 		}
 	}
-	if weekActs != nil {
-		weeks = append(weeks, weekActs)
+	if thisWeek != nil {
+		allWeeks = append(allWeeks, thisWeek)
 	}
-	var sums []WeekSummary
-	for _, w := range weeks {
+	var result []WeekSummary
+	for _, w := range allWeeks {
 		var dist float64
 		for _, a := range w {
 			dist += a.Distance
@@ -149,83 +106,157 @@ func ComputeWeeklySummaries(activities []*strava.ActivitySummary) []WeekSummary 
 			Distance: dist,
 			Time:     time.Duration(elapsed) * time.Second,
 		}
-		sums = append(sums, sum)
+		result = append(result, sum)
 	}
-	return sums
+	return result
 }
 
-func FetchMarathonTrackingForUser(ctx context.Context, s *strava.Client) ([]WeekSummary, error) {
-	as, err := strava.NewCurrentAthleteService(s).ListActivities().Do()
-	if err != nil {
-		return nil, err
-	}
-	return ComputeWeeklySummaries(as), nil
+// ActivityFetcher fetches activities from Strava for a given user.
+type ActivityFetcher interface {
+	FetchActivities(token string) ([]*strava.ActivitySummary, error)
 }
 
-// GetUsers fetches all users from the datastore.
-func GetUsers(ctx context.Context, ds *datastore.Client) ([]User, error) {
-	result := make([]User, 0)
-	_, err := ds.GetAll(ctx, datastore.NewQuery("User"), &result)
+func DoAsync(f func(interface{}) (interface{}, error), inputs []interface{}) ([]interface{}, error) {
+	var wg sync.WaitGroup
+	wg.Add(len(inputs))
+	result := make([]interface{}, len(inputs))
+	fail := make(chan error, len(inputs))
+	for i, in := range inputs {
+		go func(i int, in interface{}) {
+			defer wg.Done()
+			out, err := f(in)
+			if err != nil {
+				fail <- err
+				return
+			}
+			result[i] = out
+		}(i, in)
+	}
+	wg.Wait()
+	close(fail)
+	err := <-fail
 	if err != nil {
 		return nil, err
 	}
 	return result, nil
 }
 
-// Fetches activities.
-type ActivityFetcher interface {
-	FetchActivities(token string) ([]*strava.ActivitySummary, error)
-}
-
-type fetcher struct {
-	httpClient *http.Client
-}
-
-func (f fetcher) FetchActivities(token string) ([]*strava.ActivitySummary, error) {
-	s := strava.NewClient(token, f.httpClient)
-	startDate := Must(time.Parse("2006-01-02", "2018-01-01"))
-	return strava.NewCurrentAthleteService(s).ListActivities().After(int(startDate.Unix())).Do()
-}
-
-// Must returns its input time or panics if there's an error.
-func Must(t time.Time, err error) time.Time {
-	if err != nil {
-		panic(err)
+func FetchUsersActivity(users []User, fetcher ActivityFetcher) ([][]*strava.ActivitySummary, error) {
+	var cs []chan []*strava.ActivitySummary
+	for _, u := range users {
+		// Note, we give this capacity 1 so that we don't leak goroutines. When
+		// iterating over these channels later we don't guarantee that we read
+		// them all, so having capacity in the channel means that the goroutine
+		// can terminate and the channel itself can get gc'd.
+		// An alternative would be to read all the channels afterwards which
+		// would have the effect of unblocking the goroutines waiting for a
+		// chance to write.
+		c := make(chan []*strava.ActivitySummary, 1)
+		cs = append(cs, c)
+		go func(u User) {
+			defer close(c)
+			acts, err := fetcher.FetchActivities(u.StravaToken)
+			if err != nil {
+				return
+			}
+			c <- acts
+		}(u)
 	}
-	return t
+	var result [][]*strava.ActivitySummary
+	for _, c := range cs {
+		val, ok := <-c
+		if !ok {
+			return nil, errors.New("Failed")
+		}
+		result = append(result, val)
+	}
+	return result, nil
 }
 
-type MainTplArgs struct {
-	Umt         []*UserMarathonTracking
-	ClientId    string
-	RedirectUri string
+func FetchUsersActivity3(users []User, fetcher ActivityFetcher) ([][]*strava.ActivitySummary, error) {
+	var wg sync.WaitGroup
+	wg.Add(len(users))
+	fail := make(chan error, len(users))
+	var m sync.Map
+	for i, u := range users {
+		go func(i int, u User) {
+			defer wg.Done()
+			act, err := fetcher.FetchActivities(u.StravaToken)
+			if err != nil {
+				fail <- err
+				return
+			}
+			m.Store(i, act)
+		}(i, u)
+	}
+	wg.Wait()
+	close(fail)
+	err := <-fail
+	if err != nil {
+		return nil, err
+	}
+	r := make([][]*strava.ActivitySummary, len(users))
+	m.Range(func(key, value interface{}) bool {
+		r[key.(int)] = value.([]*strava.ActivitySummary)
+		return true
+	})
+	return r, nil
 }
 
-const mainTplText = `
-<div>
-  <div style="display: flex; justify-content: center">
-  {{range .Umt}}
-    <div style="padding: 0 1em">
-      <pre>{{.Name}}</pre>
-      <pre>
-{{. | makeTable}}
-      </pre>
-    </div>
-  {{end}}
-  </div>
+func FetchUsersActivity2(users []User, fetcher ActivityFetcher) ([][]*strava.ActivitySummary, error) {
+	var wg sync.WaitGroup
+	wg.Add(len(users))
 
-  <a href="https://www.strava.com/oauth/authorize?client_id={{.ClientId}}&redirect_uri={{.RedirectUri | urlquery}}&response_type=code">
-    Register
-  </a>
-</div>
-`
+	type resp struct {
+		i    int
+		acts []*strava.ActivitySummary
+	}
+	fail := make(chan error, len(users))
+	rchan := make(chan resp, len(users))
 
-var mainTpl = template.Must(template.New("").Funcs(template.FuncMap{
-	"makeTable": makeTable,
-}).Parse(mainTplText))
+	for i, u := range users {
+		go func(i int, u User) {
+			defer wg.Done()
+			act, err := fetcher.FetchActivities(u.StravaToken)
+			if err != nil {
+				fail <- err
+				return
+			}
+			rchan <- resp{i, act}
+		}(i, u)
+	}
+	wg.Wait()
+	close(rchan)
+	select {
+	case err := <-fail:
+		return nil, err
+	default:
+	}
+	result := make([][]*strava.ActivitySummary, len(users))
+	for r := range rchan {
+		result[r.i] = r.acts
+	}
+	return result, nil
+}
+
+func FetchUserHistory(ctx context.Context, users []User, fetcher ActivityFetcher) ([]*UserMarathonTracking, error) {
+	acts, err := FetchUsersActivity(users, fetcher)
+	if err != nil {
+		return nil, err
+	}
+	var result []*UserMarathonTracking
+	for i, act := range acts {
+		umt := &UserMarathonTracking{
+			Name:  users[i].FirstName,
+			Weeks: ComputeWeeklySummaries(act),
+		}
+		result = append(result, umt)
+	}
+	return result, nil
+}
 
 // FetchUserHistory fetches each user's marathon training history.
-func FetchUserHistory(users []User, fetcher ActivityFetcher) ([]*UserMarathonTracking, error) {
+func FetchUserHistory2(ctx context.Context, users []User, fetcher ActivityFetcher) ([]*UserMarathonTracking, error) {
 	results := make(chan *UserMarathonTracking)
 	defer func() {
 		close(results)
@@ -238,12 +269,11 @@ func FetchUserHistory(users []User, fetcher ActivityFetcher) ([]*UserMarathonTra
 			}()
 			acts, err := fetcher.FetchActivities(u.StravaToken)
 			if err != nil {
-				log.Printf("Failed to fetch activites: %s", err)
-				fmt.Printf("Failed to fetch activites: %s", err)
+				log.Errorf(ctx, "Failed to fetch activites: %s", err.Error())
 				return
 			}
 			mt := ComputeWeeklySummaries(acts)
-			name := acts[0].Athlete.FirstName
+			name := u.FirstName
 
 			result = &UserMarathonTracking{
 				Name:  name,
@@ -268,41 +298,19 @@ func FetchUserHistory(users []User, fetcher ActivityFetcher) ([]*UserMarathonTra
 	return mts, nil
 }
 
-// userKey is a key based on strava's athlete id.
-func userKey(id int64) *datastore.Key {
-	return datastore.IDKey("User", id, nil)
-}
-
-func makeTable(umt *UserMarathonTracking) string {
-	buf := bytes.NewBuffer(nil)
-	tw := tablewriter.NewWriter(buf)
-	tw.SetHeader([]string{"Date", "Count", "Distance", "Duration"})
-	for _, w := range umt.Weeks {
-
-		tw.Append([]string{
-			w.Date.Format("2006/01/02"),
-			fmt.Sprintf("%d", w.Count),
-			fmt.Sprintf("%0.1fkm", w.Distance),
-			fmt.Sprintf("%s", w.Time),
-		})
-	}
-	tw.Render()
-	return buf.String()
-}
-
 func init() {
-	stravaClientId, err := strconv.Atoi(os.Getenv("STRAVA_CLIENT_ID"))
+	stravaClientID, err := strconv.Atoi(os.Getenv("STRAVA_CLIENT_ID"))
 	if err != nil {
-		// panic(errors.New("STRAVA_CLIENT_ID not set"))
+		fmt.Printf("STRAVA_CLIENT_ID not set\n")
+		return
 	}
-	strava.ClientId = stravaClientId
+	strava.ClientId = stravaClientID
 	stravaClientSecret := os.Getenv("STRAVA_CLIENT_SECRET")
 	if stravaClientSecret == "" {
-		// panic(errors.New("STRAVA_CLIENT_SECRET not set"))
+		panic(errors.New("STRAVA_CLIENT_SECRET not set"))
 	}
 	strava.ClientSecret = stravaClientSecret
 
-	flag.Parse()
 	auth := strava.OAuthAuthenticator{
 		CallbackURL: "/oauth_callback",
 		RequestClientGenerator: func(r *http.Request) *http.Client {
@@ -311,35 +319,36 @@ func init() {
 	}
 	http.HandleFunc(auth.CallbackURL, auth.HandlerFunc(func(auth *strava.AuthorizationResponse, w http.ResponseWriter, r *http.Request) {
 		ctx := appengine.NewContext(r)
-		ds := NewDatastore(ctx)
-		_, err := RegisterNewUser(ctx, ds, auth)
+		_, err := RegisterNewUser(ctx, auth)
 		if err != nil {
-			panic(err)
+			handleError(w, err)
+			return
 		}
 		http.Redirect(w, r, "/", http.StatusFound)
 	}, func(err error, w http.ResponseWriter, r *http.Request) {
-		panic(err)
+		handleError(w, err)
 	}))
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// w.Write([]byte("ok"))
-		ctx := appengine.NewContext(r)
-		ds := NewDatastore(ctx)
-		users, err := GetUsers(ctx, ds)
-		if err != nil {
-			handleError(w, err)
-			return
-		}
-		umt, err := FetchUserHistory(users, fetcher{urlfetch.Client(ctx)})
-		if err != nil {
-			handleError(w, err)
-			return
-		}
+	http.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok")) // nolint: errcheck
+	})
 
-		err = mainTpl.Execute(w, MainTplArgs{
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		ctx := appengine.NewContext(r)
+		users, err := GetUsers(ctx)
+		if err != nil {
+			handleError(w, err)
+			return
+		}
+		umt, err := FetchUserHistory(ctx, users, stravaFetcher{urlfetch.Client(ctx)})
+		if err != nil {
+			handleError(w, err)
+			return
+		}
+		err = mainTpl.Execute(w, mainTplArgs{
 			Umt:         umt,
-			ClientId:    fmt.Sprintf("%d", stravaClientId),
-			RedirectUri: "jaju-running.appspot.com/oauth_callback",
+			ClientID:    fmt.Sprintf("%d", stravaClientID),
+			RedirectURI: "https://jaju-running.appspot.com/oauth_callback",
 		})
 		if err != nil {
 			handleError(w, err)
@@ -350,5 +359,5 @@ func init() {
 
 func handleError(w http.ResponseWriter, err error) {
 	w.WriteHeader(500)
-	w.Write([]byte(fmt.Sprintf("Failed: %s", err)))
+	w.Write([]byte(fmt.Sprintf("Failed: %s", err))) // nolint: errcheck
 }

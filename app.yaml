@@ -8,6 +8,6 @@ handlers:
 env_variables:
   NAMESPACE: 'test'
   PROJECT_ID: 'jaju-running'
-  STRAVA_CLIENT_ID: 'fake-id'
-  STRAVA_CLIENT_SECRET: 'fake-secret'
+  STRAVA_CLIENT_ID: '23981'
+  STRAVA_CLIENT_SECRET: '9a8462774ba6aaae89f2b9afdc03a20a8e136c5f'
   # DATASTORE_EMULATOR_HOST: 'localhost:8081'
